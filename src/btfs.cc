@@ -20,6 +20,8 @@ along with BTFS.  If not, see <http://www.gnu.org/licenses/>.
 #define FUSE_USE_VERSION 26
 
 #include <cstdlib>
+#include <iostream>
+#include <fstream>
 
 #include <pthread.h>
 #include <sys/types.h>
@@ -27,18 +29,26 @@ along with BTFS.  If not, see <http://www.gnu.org/licenses/>.
 
 #include <fuse.h>
 
+// The below pragma lines will silence lots of compiler warnings in the
+// libtorrent headers file. Not btfs' fault.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wsign-conversion"
+#pragma GCC diagnostic ignored "-Wconversion"
 #include <libtorrent/torrent_info.hpp>
 #include <libtorrent/session.hpp>
 #include <libtorrent/alert.hpp>
 #include <libtorrent/peer_request.hpp>
 #include <libtorrent/alert_types.hpp>
 #include <libtorrent/magnet_uri.hpp>
+#include <libtorrent/version.hpp>
+#pragma GCC diagnostic pop
 
 #include <curl/curl.h>
 
 #include "btfs.h"
 
 #define RETV(s, v) { s; return v; };
+#define STRINGIFY(s) #s
 
 using namespace btfs;
 
@@ -59,11 +69,14 @@ std::map<std::string,std::set<std::string> > dirs;
 pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t signal_cond = PTHREAD_COND_INITIALIZER;
 
+// Time used as "last modified" time
+time_t time_of_mount;
+
 static struct btfs_params params;
 
 static bool
-move_to_next_unfinished(int& piece) {
-	for (; piece < handle.get_torrent_info().num_pieces(); piece++) {
+move_to_next_unfinished(int& piece, int num_pieces) {
+	for (; piece < num_pieces; piece++) {
 		if (!handle.have_piece(piece))
 			return true;
 	}
@@ -73,14 +86,20 @@ move_to_next_unfinished(int& piece) {
 
 static void
 jump(int piece, int size) {
+#if LIBTORRENT_VERSION_NUM < 10000
+	libtorrent::torrent_info ti = handle.get_torrent_info();
+#else
+	libtorrent::torrent_info ti = *handle.torrent_file();
+#endif
+
 	int tail = piece;
 
-	if (!move_to_next_unfinished(tail))
+	if (!move_to_next_unfinished(tail, ti.num_pieces()))
 		return;
 
 	cursor = tail;
 
-	int pl = handle.get_torrent_info().piece_length();
+	int pl = ti.piece_length();
 
 	for (int b = 0; b < 16 * pl; b += pl) {
 		handle.piece_priority(tail++, 7);
@@ -96,22 +115,30 @@ advance() {
 	jump(cursor, 0);
 }
 
-Read::Read(char *buf, int index, int offset, int size) {
-	libtorrent::torrent_info metadata = handle.get_torrent_info();
+Read::Read(char *buf, int index, off_t offset, size_t size) {
+#if LIBTORRENT_VERSION_NUM < 10000
+	libtorrent::torrent_info ti = handle.get_torrent_info();
+#else
+	libtorrent::torrent_info ti = *handle.torrent_file();
+#endif
 
-	libtorrent::file_entry file = metadata.file_at(index);
+#if LIBTORRENT_VERSION_NUM < 10100
+	int64_t file_size = ti.file_at(index).size;
+#else
+	int64_t file_size = ti.files().file_size(index);
+#endif
 
-	while (size > 0 && offset < file.size) {
-		libtorrent::peer_request part = metadata.map_file(index,
-			offset, size);
+	while (size > 0 && offset < file_size) {
+		libtorrent::peer_request part = ti.map_file(index, offset,
+			(int) size);
 
 		part.length = std::min(
-			metadata.piece_size(part.piece) - part.start,
+			ti.piece_size(part.piece) - part.start,
 			part.length);
 
 		parts.push_back(Part(part, buf));
 
-		size -= part.length;
+		size -= (size_t) part.length;
 		offset += part.length;
 		buf += part.length;
 	}
@@ -121,7 +148,7 @@ void Read::copy(int piece, char *buffer, int size) {
 	for (parts_iter i = parts.begin(); i != parts.end(); ++i) {
 		if (i->part.piece == piece && !i->filled)
 			i->filled = (memcpy(i->buf, buffer + i->part.start,
-				i->part.length)) != NULL;
+				(size_t) i->part.length)) != NULL;
 	}
 }
 
@@ -172,7 +199,11 @@ static void
 setup() {
 	printf("Got metadata. Now ready to start downloading.\n");
 
+#if LIBTORRENT_VERSION_NUM < 10000
 	libtorrent::torrent_info ti = handle.get_torrent_info();
+#else
+	libtorrent::torrent_info ti = *handle.torrent_file();
+#endif
 
 	if (params.browse_only)
 		handle.pause();
@@ -183,7 +214,11 @@ setup() {
 
 		std::string parent("");
 
+#if LIBTORRENT_VERSION_NUM < 10100
 		char *p = strdup(ti.file_at(i).path.c_str());
+#else
+		char *p = strdup(ti.files().file_path(i).c_str());
+#endif
 
 		for (char *x = strtok(p, "/"); x; x = strtok(NULL, "/")) {
 			if (strlen(x) <= 0)
@@ -203,12 +238,16 @@ setup() {
 		free(p);
 
 		// Path <-> file index mapping
+#if LIBTORRENT_VERSION_NUM < 10100
 		files["/" + ti.file_at(i).path] = i;
+#else
+		files["/" + ti.files().file_path(i)] = i;
+#endif
 	}
 }
 
 static void
-handle_read_piece_alert(libtorrent::read_piece_alert *a) {
+handle_read_piece_alert(libtorrent::read_piece_alert *a, Log *log) {
 	printf("%s: piece %d size %d\n", __func__, a->piece, a->size);
 
 	pthread_mutex_lock(&lock);
@@ -224,7 +263,7 @@ handle_read_piece_alert(libtorrent::read_piece_alert *a) {
 }
 
 static void
-handle_piece_finished_alert(libtorrent::piece_finished_alert *a) {
+handle_piece_finished_alert(libtorrent::piece_finished_alert *a, Log *log) {
 	printf("%s: %d\n", __func__, a->piece_index);
 
 	pthread_mutex_lock(&lock);
@@ -240,12 +279,7 @@ handle_piece_finished_alert(libtorrent::piece_finished_alert *a) {
 }
 
 static void
-handle_metadata_failed_alert(libtorrent::metadata_failed_alert *a) {
-	//printf("%s\n", __func__);
-}
-
-static void
-handle_torrent_added_alert(libtorrent::torrent_added_alert *a) {
+handle_torrent_added_alert(libtorrent::torrent_added_alert *a, Log *log) {
 	//printf("%s()\n", __func__);
 
 	pthread_mutex_lock(&lock);
@@ -259,7 +293,8 @@ handle_torrent_added_alert(libtorrent::torrent_added_alert *a) {
 }
 
 static void
-handle_metadata_received_alert(libtorrent::metadata_received_alert *a) {
+handle_metadata_received_alert(libtorrent::metadata_received_alert *a,
+		Log *log) {
 	//printf("%s\n", __func__);
 
 	pthread_mutex_lock(&lock);
@@ -271,6 +306,60 @@ handle_metadata_received_alert(libtorrent::metadata_received_alert *a) {
 	pthread_mutex_unlock(&lock);
 }
 
+static void
+handle_alert(libtorrent::alert *a, Log *log) {
+	switch (a->type()) {
+	case libtorrent::read_piece_alert::alert_type:
+		handle_read_piece_alert(
+			(libtorrent::read_piece_alert *) a, log);
+		break;
+	case libtorrent::piece_finished_alert::alert_type:
+		*log << a->message() << std::endl;
+		handle_piece_finished_alert(
+			(libtorrent::piece_finished_alert *) a, log);
+		break;
+	case libtorrent::metadata_received_alert::alert_type:
+		*log << a->message() << std::endl;
+		handle_metadata_received_alert(
+			(libtorrent::metadata_received_alert *) a, log);
+		break;
+	case libtorrent::torrent_added_alert::alert_type:
+		*log << a->message() << std::endl;
+		handle_torrent_added_alert(
+			(libtorrent::torrent_added_alert *) a, log);
+		break;
+	case libtorrent::metadata_failed_alert::alert_type:
+	case libtorrent::tracker_announce_alert::alert_type:
+	case libtorrent::tracker_reply_alert::alert_type:
+	case libtorrent::tracker_warning_alert::alert_type:
+	case libtorrent::tracker_error_alert::alert_type:
+	case libtorrent::dht_bootstrap_alert::alert_type:
+	case libtorrent::dht_announce_alert::alert_type:
+	case libtorrent::dht_reply_alert::alert_type:
+	case libtorrent::lsd_peer_alert::alert_type:
+		*log << a->message() << std::endl;
+		break;
+	case libtorrent::stats_alert::alert_type:
+		//*log << a->message() << std::endl;
+		break;
+	default:
+		break;
+	}
+
+#if LIBTORRENT_VERSION_NUM < 10100
+	delete a;
+#endif
+}
+
+
+static void
+alert_queue_loop_destroy(void *data) {
+	Log *log = (Log *) data;
+
+	if (log)
+		delete log;
+}
+
 static void*
 alert_queue_loop(void *data) {
 	int oldstate, oldtype;
@@ -278,41 +367,34 @@ alert_queue_loop(void *data) {
 	pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, &oldstate);
 	pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, &oldtype);
 
+	pthread_cleanup_push(&alert_queue_loop_destroy, data);
+
 	while (1) {
 		if (!session->wait_for_alert(libtorrent::seconds(1)))
 			continue;
 
-		std::auto_ptr<libtorrent::alert> a = session->pop_alert();
+#if LIBTORRENT_VERSION_NUM < 10100
+		std::deque<libtorrent::alert*> alerts;
 
-		switch (a->type()) {
-		case libtorrent::read_piece_alert::alert_type:
-			handle_read_piece_alert(
-				(libtorrent::read_piece_alert *) a.get());
-			break;
-		case libtorrent::piece_finished_alert::alert_type:
-			handle_piece_finished_alert(
-				(libtorrent::piece_finished_alert *) a.get());
-			break;
-		case libtorrent::metadata_failed_alert::alert_type:
-			handle_metadata_failed_alert(
-				(libtorrent::metadata_failed_alert *) a.get());
-			break;
-		case libtorrent::metadata_received_alert::alert_type:
-			handle_metadata_received_alert(
-				(libtorrent::metadata_received_alert *) a.get());
-			break;
-		case libtorrent::torrent_added_alert::alert_type:
-			handle_torrent_added_alert(
-				(libtorrent::torrent_added_alert *) a.get());
-			break;
-		case libtorrent::add_torrent_alert::alert_type:
-			// TODO
-			break;
-		default:
-			//printf("unknown event %d\n", a->type());
-			break;
+		session->pop_alerts(&alerts);
+
+		for (std::deque<libtorrent::alert*>::iterator i =
+				alerts.begin(); i != alerts.end(); ++i) {
+			handle_alert(*i, (Log *) data);
 		}
+#else
+		std::vector<libtorrent::alert*> alerts;
+
+		session->pop_alerts(&alerts);
+
+		for (std::vector<libtorrent::alert*>::iterator i =
+				alerts.begin(); i != alerts.end(); ++i) {
+			handle_alert(*i, (Log *) data);
+		}
+#endif
 	}
+
+	pthread_cleanup_pop(1);
 
 	return NULL;
 }
@@ -338,15 +420,25 @@ btfs_getattr(const char *path, struct stat *stbuf) {
 
 	stbuf->st_uid = getuid();
 	stbuf->st_gid = getgid();
+	stbuf->st_mtime = time_of_mount;
 
 	if (strcmp(path, "/") == 0 || is_dir(path)) {
 		stbuf->st_mode = S_IFDIR | 0755;
 	} else {
-		libtorrent::file_entry file =
-			handle.get_torrent_info().file_at(files[path]);
+#if LIBTORRENT_VERSION_NUM < 10000
+		libtorrent::torrent_info ti = handle.get_torrent_info();
+#else
+		libtorrent::torrent_info ti = *handle.torrent_file();
+#endif
+
+#if LIBTORRENT_VERSION_NUM < 10100
+		int64_t file_size = ti.file_at(files[path]).size;
+#else
+		int64_t file_size = ti.files().file_size(files[path]);
+#endif
 
 		stbuf->st_mode = S_IFREG | 0444;
-		stbuf->st_size = file.size;
+		stbuf->st_size = file_size;
 	}
 
 	pthread_mutex_unlock(&lock);
@@ -428,16 +520,26 @@ static void *
 btfs_init(struct fuse_conn_info *conn) {
 	pthread_mutex_lock(&lock);
 
+	time_of_mount = time(NULL);
+
 	libtorrent::add_torrent_params *p = (libtorrent::add_torrent_params *)
 		fuse_get_context()->private_data;
 
+	int flags =
+		libtorrent::session::add_default_plugins |
+		libtorrent::session::start_default_features;
+
 	int alerts =
-		//libtorrent::alert::all_categories |
+		libtorrent::alert::tracker_notification |
+		libtorrent::alert::stats_notification |
 		libtorrent::alert::storage_notification |
 		libtorrent::alert::progress_notification |
 		libtorrent::alert::status_notification |
-		libtorrent::alert::error_notification;
+		libtorrent::alert::error_notification |
+		libtorrent::alert::dht_notification |
+		libtorrent::alert::peer_notification;
 
+#if LIBTORRENT_VERSION_NUM < 10100
 	session = new libtorrent::session(
 		libtorrent::fingerprint(
 			"LT",
@@ -445,25 +547,65 @@ btfs_init(struct fuse_conn_info *conn) {
 			LIBTORRENT_VERSION_MINOR,
 			0,
 			0),
-		std::make_pair(6881, 6889),
+		std::make_pair(params.min_port, params.max_port),
 		"0.0.0.0",
-		libtorrent::session::add_default_plugins,
+		flags,
 		alerts);
-
-	pthread_create(&alert_thread, NULL, alert_queue_loop, NULL);
-
-#ifndef __APPLE__
-	pthread_setname_np(alert_thread, "alert");
-#endif
 
 	libtorrent::session_settings se = session->settings();
 
 	se.strict_end_game_mode = false;
 	se.announce_to_all_trackers = true;
 	se.announce_to_all_tiers = true;
+	se.download_rate_limit = params.max_download_rate * 1024;
+	se.upload_rate_limit = params.max_upload_rate * 1024;
 
 	session->set_settings(se);
+	session->add_dht_router(std::make_pair("router.bittorrent.com", 6881));
+	session->add_dht_router(std::make_pair("router.utorrent.com", 6881));
+	session->add_dht_router(std::make_pair("dht.transmissionbt.com", 6881));
 	session->async_add_torrent(*p);
+#else
+	libtorrent::settings_pack pack;
+
+	std::ostringstream interfaces;
+
+	// First port
+	interfaces << "0.0.0.0:" << params.min_port;
+
+	// Possibly more ports, but at most 5
+	for (int i = params.min_port + 1; i <= params.max_port &&
+			i < params.min_port + 5; i++)
+		interfaces << ",0.0.0.0:" << i;
+
+	std::string fingerprint =
+		"LT"
+		STRINGIFY(LIBTORRENT_VERSION_MAJOR)
+		STRINGIFY(LIBTORRENT_VERSION_MINOR)
+		"00";
+
+	pack.set_str(pack.listen_interfaces, interfaces.str());
+	pack.set_bool(pack.strict_end_game_mode, false);
+	pack.set_bool(pack.announce_to_all_trackers, true);
+	pack.set_bool(pack.announce_to_all_tiers, true);
+	pack.set_int(pack.download_rate_limit, params.max_download_rate * 1024);
+	pack.set_int(pack.upload_rate_limit, params.max_upload_rate * 1024);
+	pack.set_int(pack.alert_mask, alerts);
+
+	session = new libtorrent::session(pack, flags);
+
+	session->add_dht_router(std::make_pair("router.bittorrent.com", 6881));
+	session->add_dht_router(std::make_pair("router.utorrent.com", 6881));
+	session->add_dht_router(std::make_pair("dht.transmissionbt.com", 6881));
+	session->add_torrent(*p);
+#endif
+
+	pthread_create(&alert_thread, NULL, alert_queue_loop,
+		new Log(p->save_path + "/../log.txt"));
+
+#ifdef HAVE_PTHREAD_SETNAME_NP
+	pthread_setname_np(alert_thread, "alert");
+#endif
 
 	pthread_mutex_unlock(&lock);
 
@@ -477,20 +619,16 @@ btfs_destroy(void *user_data) {
 	pthread_cancel(alert_thread);
 	pthread_join(alert_thread, NULL);
 
-	std::string path = handle.save_path();
-
 	session->remove_torrent(handle,
 		params.keep ? 0 : libtorrent::session::delete_files);
 
 	delete session;
 
-	rmdir(path.c_str());
-
 	pthread_mutex_unlock(&lock);
 }
 
 static bool
-populate_target(libtorrent::add_torrent_params& p, char *arg) {
+populate_target(std::string& target, char *arg) {
 	std::string templ;
 
 	if (arg) {
@@ -504,8 +642,7 @@ populate_target(libtorrent::add_torrent_params& p, char *arg) {
 
 	if (mkdir(templ.c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH) < 0) {
 		if (errno != EEXIST)
-			RETV(fprintf(stderr, "Failed to create target: %m\n"),
-				false);
+			RETV(perror("Failed to create target"), false);
 	}
 
 	templ += "/btfs-XXXXXX";
@@ -516,7 +653,7 @@ populate_target(libtorrent::add_torrent_params& p, char *arg) {
 		char *x = realpath(s, NULL);
 
 		if (x)
-			p.save_path = x;
+			target = x;
 		else
 			perror("Failed to expand target");
 
@@ -527,7 +664,7 @@ populate_target(libtorrent::add_torrent_params& p, char *arg) {
 
 	free(s);
 
-	return p.save_path.length() > 0;
+	return target.length() > 0;
 }
 
 static size_t
@@ -563,18 +700,24 @@ populate_metadata(libtorrent::add_torrent_params& p, const char *arg) {
 		CURLcode res = curl_easy_perform(ch);
 
 		if(res != CURLE_OK)
-			RETV(fprintf(stderr, "curl failed: %s\n",
+			RETV(fprintf(stderr, "Download metadata failed: %s\n",
 				curl_easy_strerror(res)), false);
 
 		curl_easy_cleanup(ch);
 
 		libtorrent::error_code ec;
 
+#if LIBTORRENT_VERSION_NUM < 10100
 		p.ti = new libtorrent::torrent_info((const char *) output.buf,
-			output.size, ec);
+			(int) output.size, ec);
+#else
+		p.ti = boost::make_shared<libtorrent::torrent_info>(
+			(const char *) output.buf, (int) output.size,
+			boost::ref(ec));
+#endif
 
 		if (ec)
-			RETV(fprintf(stderr, "Can't load metadata: %s\n",
+			RETV(fprintf(stderr, "Parse metadata failed: %s\n",
 				ec.message().c_str()), false);
 
 		if (params.browse_only)
@@ -585,23 +728,27 @@ populate_metadata(libtorrent::add_torrent_params& p, const char *arg) {
 		parse_magnet_uri(uri, p, ec);
 
 		if (ec)
-			RETV(fprintf(stderr, "Can't load magnet: %s\n",
+			RETV(fprintf(stderr, "Parse magnet failed: %s\n",
 				ec.message().c_str()), false);
 	} else {
 		char *r = realpath(uri.c_str(), NULL);
 
 		if (!r)
-			RETV(fprintf(stderr, "Can't find metadata: %m\n"),
-				false);
+			RETV(perror("Find metadata failed"), false);
 
 		libtorrent::error_code ec;
 
+#if LIBTORRENT_VERSION_NUM < 10100
 		p.ti = new libtorrent::torrent_info(r, ec);
+#else
+		p.ti = boost::make_shared<libtorrent::torrent_info>(r,
+			boost::ref(ec));
+#endif
 
 		free(r);
 
 		if (ec)
-			RETV(fprintf(stderr, "Can't load metadata: %s\n",
+			RETV(fprintf(stderr, "Parse metadata failed: %s\n",
 				ec.message().c_str()), false);
 
 		if (params.browse_only)
@@ -614,14 +761,18 @@ populate_metadata(libtorrent::add_torrent_params& p, const char *arg) {
 #define BTFS_OPT(t, p, v) { t, offsetof(struct btfs_params, p), v }
 
 static const struct fuse_opt btfs_opts[] = {
-	BTFS_OPT("-v",            version,     1),
-	BTFS_OPT("--version",     version,     1),
-	BTFS_OPT("-h",            help,        1),
-	BTFS_OPT("--help",        help,        1),
-	BTFS_OPT("-b",            browse_only, 1),
-	BTFS_OPT("--browse-only", browse_only, 1),
-	BTFS_OPT("-k",            keep,        1),
-	BTFS_OPT("--keep",        keep,        1),
+	BTFS_OPT("-v",                           version,              1),
+	BTFS_OPT("--version",                    version,              1),
+	BTFS_OPT("-h",                           help,                 1),
+	BTFS_OPT("--help",                       help,                 1),
+	BTFS_OPT("-b",                           browse_only,          1),
+	BTFS_OPT("--browse-only",                browse_only,          1),
+	BTFS_OPT("-k",                           keep,                 1),
+	BTFS_OPT("--keep",                       keep,                 1),
+	BTFS_OPT("--min-port=%lu",               min_port,             4),
+	BTFS_OPT("--max-port=%lu",               max_port,             4),
+	BTFS_OPT("--max-download-rate=%lu",      max_download_rate,    4),
+	BTFS_OPT("--max-upload-rate=%lu",        max_upload_rate,      4),
 	FUSE_OPT_END
 };
 
@@ -641,6 +792,22 @@ btfs_process_arg(void *data, const char *arg, int key,
 	}
 
 	return 1;
+}
+
+static void
+print_help() {
+	printf("usage: " PACKAGE " [options] metadata mountpoint\n");
+	printf("\n");
+	printf("btfs options:\n");
+	printf("    --version -v           show version information\n");
+	printf("    --help -h              show this message\n");
+	printf("    --browse-only -b       download metadata only\n");
+	printf("    --keep -k              keep files after unmount\n");
+	printf("    --min-port=N           start of listen port range\n");
+	printf("    --max-port=N           end of listen port range\n");
+	printf("    --max-download-rate=N  max download rate (in kB/s)\n");
+	printf("    --max-upload-rate=N    max upload rate (in kB/s)\n");
+	printf("\n");
 }
 
 int
@@ -664,8 +831,8 @@ main(int argc, char *argv[]) {
 		params.help = 1;
 
 	if (params.version) {
-		// Print version
 		printf(PACKAGE " version: " VERSION "\n");
+		printf("libtorrent version: " LIBTORRENT_VERSION "\n");
 
 		// Let FUSE print more versions
 		fuse_opt_add_arg(&args, "--version");
@@ -675,15 +842,7 @@ main(int argc, char *argv[]) {
 	}
 
 	if (params.help) {
-		// Print usage
-		printf("usage: " PACKAGE " [options] metadata mountpoint\n");
-		printf("\n");
-		printf("btfs options:\n");
-		printf("    --version -v           show version information\n");
-		printf("    --help -h              show this message\n");
-		printf("    --browse-only -b       download metadata only\n");
-		printf("    --keep -k              keep files after unmount\n");
-		printf("\n");
+		print_help();
 
 		// Let FUSE print more help
 		fuse_opt_add_arg(&args, "-ho");
@@ -692,13 +851,32 @@ main(int argc, char *argv[]) {
 		return 0;
 	}
 
+	if (params.min_port == 0 && params.max_port == 0) {
+		// Default ports are the standard Bittorrent range
+		params.min_port = 6881;
+		params.max_port = 6889;
+	} else if (params.min_port == 0) {
+		params.min_port = 1024;
+	} else if (params.max_port == 0) {
+		params.max_port = 65535;
+	}
+
+	if (params.min_port > params.max_port)
+		RETV(fprintf(stderr, "Invalid port range\n"), -1);
+
+	std::string target;
+
+	if (!populate_target(target, NULL))
+		return -1;
+
 	libtorrent::add_torrent_params p;
 
 	p.flags &= ~libtorrent::add_torrent_params::flag_auto_managed;
 	p.flags &= ~libtorrent::add_torrent_params::flag_paused;
+	p.save_path = target + "/files";
 
-	if (!populate_target(p, NULL))
-		return -1;
+	if (mkdir(p.save_path.c_str(), 0777) < 0)
+		RETV(perror("Failed to create files directory"), -1);
 
 	curl_global_init(CURL_GLOBAL_ALL);
 
@@ -708,6 +886,14 @@ main(int argc, char *argv[]) {
 	fuse_main(args.argc, args.argv, &btfs_ops, (void *) &p);
 
 	curl_global_cleanup();
+
+	if (!params.keep) {
+		if (rmdir(p.save_path.c_str()))
+			RETV(perror("Failed to remove files directory"), -1);
+
+		if (rmdir(target.c_str()))
+			RETV(perror("Failed to remove target directory"), -1);
+	}
 
 	return 0;
 }
